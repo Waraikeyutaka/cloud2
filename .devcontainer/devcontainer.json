@@ -1,15 +1,24 @@
 {
   // クラウド利用Ⅱ 演習用の開発環境（GitHub Codespaces）
-  // コマ2の時点では Python だけを使う。Azure 関連のツールはコマ4の開始状態で追加する。
+  // コマ4から、Azure を操作するツールと、画面のビルドに使う Node.js を追加した。
+  // この変更を反映するには、コンテナーを作り直す（Codespaces: Rebuild Container）。
   "name": "cloud2",
-  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+  "image": "mcr.microsoft.com/devcontainers/python:3.11",
   "hostRequirements": {
     "cpus": 2
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/azure-cli:1": {},
+    "ghcr.io/azure/azure-dev/azd:latest": {},
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "20"
+    }
   },
   "customizations": {
     "vscode": {
       "extensions": [
-        "ms-python.python"
+        "ms-python.python",
+        "ms-azuretools.vscode-bicep"
       ],
       "settings": {
         "files.encoding": "utf8",

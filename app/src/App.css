@@ -1,0 +1,82 @@
+body {
+  font-family: 'Yu Gothic UI', 'Yu Gothic', Meiryo, sans-serif;
+  margin: 0;
+  background: #f5f7fa;
+  color: #222;
+}
+
+main {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 24px 16px;
+}
+
+form {
+  display: grid;
+  gap: 12px;
+  background: #fff;
+  padding: 16px;
+  border-radius: 8px;
+  border: 1px solid #d8dee6;
+}
+
+label {
+  display: grid;
+  gap: 4px;
+  font-weight: bold;
+}
+
+input,
+textarea {
+  font: inherit;
+  padding: 8px;
+  border: 1px solid #b8c2cf;
+  border-radius: 4px;
+}
+
+button {
+  justify-self: start;
+  font: inherit;
+  padding: 8px 20px;
+  border: none;
+  border-radius: 4px;
+  background: #3b6ea5;
+  color: #fff;
+  cursor: pointer;
+}
+
+.message {
+  color: #b3261e;
+}
+
+ul {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  gap: 12px;
+}
+
+li {
+  background: #fff;
+  padding: 12px 16px;
+  border-radius: 8px;
+  border: 1px solid #d8dee6;
+}
+
+.meta {
+  display: flex;
+  gap: 12px;
+  font-size: 0.85em;
+  color: #555;
+}
+
+.status {
+  background: #fff3cd;
+  padding: 0 8px;
+  border-radius: 4px;
+}
+
+li p {
+  margin: 4px 0 0;
+  white-space: pre-wrap;
+}

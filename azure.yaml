@@ -1,0 +1,25 @@
+# Azure Developer CLI（azd）の設定ファイル
+#   このアプリが「どのサービスから成り」「それぞれをどこへデプロイするか」を書く。
+#   インフラの定義は infra/ フォルダの Bicep にある。
+name: cloud2-base-app
+
+services:
+  # 画面（React）→ Static Web Apps
+  web:
+    project: ./app
+    language: js
+    host: staticwebapp
+    dist: dist
+    hooks:
+      # ビルドの前に、API の URL を画面の設定ファイルに書き込む
+      # （API_BASE_URL は infra/main.bicep の output。azd が環境変数として渡す）
+      prepackage:
+        posix:
+          shell: sh
+          run: echo "VITE_API_BASE_URL=$API_BASE_URL" > .env.production.local
+
+  # API（Python）→ Azure Functions
+  api:
+    project: ./api
+    language: python
+    host: function
