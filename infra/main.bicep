@@ -21,11 +21,14 @@ param webLocation string = 'eastasia'
 @description('Cosmos DB の Free tier を使うか（Free tier は1サブスクリプションに1つだけ）')
 param cosmosFreeTier bool = true
 
+@description('azd を実行している人（自分）の ID。Key Vault にシークレットを書き込む権限を与えるのに使う（azd が自動で設定する）')
+param principalId string = ''
+
 // すべてのリソースに付けるタグ（コマ3で学んだタグ）
 var tags = {
   'azd-env-name': environmentName
   course: 'cloud2'
-  lesson: '04'
+  lesson: '06'
 }
 
 // リソース名の重複を避けるための短い文字列（同じ環境名・場所なら毎回同じ値になる）
@@ -46,6 +49,7 @@ module resources 'resources.bicep' = {
     tags: tags
     resourceToken: resourceToken
     cosmosFreeTier: cosmosFreeTier
+    principalId: principalId
   }
 }
 
@@ -54,3 +58,5 @@ output AZURE_LOCATION string = location
 output AZURE_RESOURCE_GROUP string = rg.name
 output API_BASE_URL string = resources.outputs.apiBaseUrl
 output WEB_URL string = resources.outputs.webUrl
+output AZURE_FUNCTION_NAME string = resources.outputs.functionName
+output KEY_VAULT_NAME string = resources.outputs.keyVaultName
