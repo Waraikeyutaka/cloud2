@@ -1,0 +1,7 @@
+{
+  "chat_model": "google/gemma-4-31b-it:free",
+  "max_output_tokens": 400,
+  "history_token_budget": 1500,
+  "max_history_messages": 40,
+  "system_prompt": "あなたはカモメ物産（架空の会社）の社内問い合わせ窓口のアシスタントである。日本語で、簡潔に、丁寧に答える。分からないことは分からないと答える。"
+}

@@ -9,6 +9,11 @@
 // コマ6で追加したもの
 //   - Key Vault と、Key Vault に対するロールの割り当て（Functions: 読むだけ／自分: 書き込み）
 //   - Cosmos DB のデータに対するロールの割り当て（Functions のマネージドID）
+//   - Cosmos DB のキーをアプリ設定から削除し、OpenRouter のキーを Key Vault 参照にした
+//
+// コマ7で追加したもの
+//   - Cosmos DB のコンテナー conversations（アシスタントとの会話の履歴）
+//   - アプリ設定: COSMOS_CONVERSATIONS_CONTAINER、LLM_PROVIDER、PYTHON_ENABLE_INIT_INDEXING
 // =====================================================================
 param location string
 param webLocation string
@@ -19,6 +24,7 @@ param principalId string
 
 var databaseName = 'appdb'
 var containerName = 'inquiries'
+var conversationsContainerName = 'conversations'
 var deploymentContainerName = 'deploymentpackage'
 var openRouterSecretName = 'openrouter-api-key'
 
@@ -122,6 +128,23 @@ resource container 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/container
   }
 }
 
+// 会話の履歴（コマ7）: メッセージ1件を1ドキュメントとして保存する
+//   パーティションキーは会話の ID。1つの会話のメッセージは同じパーティションに入るので、
+//   会話の履歴を読むときに、1つのパーティションだけを読めばよい
+resource conversationsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2024-05-15' = {
+  parent: database
+  name: conversationsContainerName
+  properties: {
+    resource: {
+      id: conversationsContainerName
+      partitionKey: {
+        paths: [ '/conversationId' ]
+        kind: 'Hash'
+      }
+    }
+  }
+}
+
 // ---------------------------------------------------------------------
 // Functions（Flex Consumption・Python）: API
 // ---------------------------------------------------------------------
@@ -194,12 +217,6 @@ resource api 'Microsoft.Web/sites@2024-04-01' = {
           name: 'COSMOS_ENDPOINT'
           value: cosmos.properties.documentEndpoint
         }
-        // TODO(コマ6 演習手順5-1): 次の { から } までの4行（COSMOS_KEY）を削除する。
-        //   マネージドIDで接続するので、Cosmos DB のキーはもう要らない。
-        {
-          name: 'COSMOS_KEY'
-          value: cosmos.listKeys().primaryMasterKey
-        }
         {
           name: 'COSMOS_DATABASE'
           value: databaseName
@@ -208,18 +225,35 @@ resource api 'Microsoft.Web/sites@2024-04-01' = {
           name: 'COSMOS_CONTAINER'
           value: containerName
         }
-        // TODO(コマ6 演習手順5-2): ここに OPENROUTER_API_KEY のアプリ設定を加える。
-        //   値はキーそのものではなく「Key Vault 参照」にする（演習手順書を見て書く）。
+        {
+          name: 'COSMOS_CONVERSATIONS_CONTAINER'
+          value: conversationsContainerName
+        }
+        {
+          name: 'OPENROUTER_API_KEY'
+          value: '@Microsoft.KeyVault(VaultName=${keyVault.name};SecretName=${openRouterSecretName})'
+        }
+        // LLM の呼び先（mock: モックLLM／openrouter: 本物）。既定はモック（共有の利用上限を消費しない）
+        {
+          name: 'LLM_PROVIDER'
+          value: 'mock'
+        }
+        // HTTP ストリーミング（コマ7）を使うために必要な設定（Python 3.12 以前）
+        {
+          name: 'PYTHON_ENABLE_INIT_INDEXING'
+          value: '1'
+        }
       ]
     }
   }
   dependsOn: [
     deploymentContainer
+    conversationsContainer
   ]
 }
 
 // Functions の ID（マネージドID）に、Storage の Blob を読み書きする権限を与える
-// （Storage Blob Data Owner。コマ6で詳しく扱う）
+// （Storage Blob Data Owner）
 resource apiStorageBlobOwner 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(storage.id, api.id, 'b7e6dc6d-f1e8-4753-8033-0f276bb0955b')
   scope: storage

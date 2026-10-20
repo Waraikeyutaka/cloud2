@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import Assistant from './Assistant.jsx'
 
 // API の URL は、ビルドのときに azd が設定ファイル（.env.production.local）に書き込む
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? ''
@@ -44,6 +45,10 @@ export default function App() {
   return (
     <main>
       <h1>問い合わせ管理</h1>
+
+      <Assistant />
+
+      <h2>問い合わせの登録</h2>
 
       <form onSubmit={submit}>
         <label>
