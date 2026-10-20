@@ -3,3 +3,4 @@ azurefunctions-extensions-http-fastapi
 azure-cosmos
 azure-identity
 openai
+pydantic

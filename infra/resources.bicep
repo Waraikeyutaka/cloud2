@@ -14,6 +14,8 @@
 // コマ7で追加したもの
 //   - Cosmos DB のコンテナー conversations（アシスタントとの会話の履歴）
 //   - アプリ設定: COSMOS_CONVERSATIONS_CONTAINER、LLM_PROVIDER、PYTHON_ENABLE_INIT_INDEXING
+//
+// コマ8: 構成の変更はない（問い合わせのドキュメントに、分類の結果の項目が増えるだけ）
 // =====================================================================
 param location string
 param webLocation string

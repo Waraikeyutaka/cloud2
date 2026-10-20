@@ -151,3 +151,34 @@ button:disabled {
   color: #555;
   font-size: 0.9em;
 }
+
+/* ===== 分類（コマ8） ===== */
+.classification {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin: 8px 0;
+  font-size: 0.9em;
+}
+
+.tag {
+  background: #e7ecf2;
+  padding: 0 8px;
+  border-radius: 4px;
+}
+
+.tag.priority-高 {
+  background: #fdecea;
+  color: #b3261e;
+}
+
+.summary {
+  color: #333;
+}
+
+button.small {
+  padding: 4px 12px;
+  font-size: 0.9em;
+  margin-top: 4px;
+}

@@ -8,6 +8,7 @@
   POST /api/chat        アシスタントに質問する（コマ7。応答をストリーミングで返す）
                         {"conversationId": "...（省略すると新しい会話）", "message": "..."}
   GET  /api/conversations?id=...  会話の履歴を返す（コマ7。画面を開き直したときに使う）
+  POST /api/inquiries/classify?id=...  問い合わせを AI で分類し、担当に振り分ける（コマ8）
 
 接続先などの設定は、コードに書かずに「アプリ設定」（環境変数）から読む。
 注意: この時点では認証がなく、誰でも読み書きできる（コマ11で認証を加える）。
@@ -17,6 +18,7 @@ Azure Functions（Python）では、ストリーミングを有効にすると�
 すべての HTTP の関数で FastAPI の Request / Response の型を使う必要がある。
 """
 
+import asyncio
 import datetime
 import hashlib
 import json
@@ -25,9 +27,11 @@ import uuid
 
 import azure.functions as func
 from azure.cosmos import CosmosClient
+from azure.cosmos.exceptions import CosmosResourceNotFoundError
 from azure.identity import DefaultAzureCredential
 from azurefunctions.extensions.http.fastapi import JSONResponse, Request, StreamingResponse
 
+import classification
 import llm
 from history import trim_history
 
@@ -72,7 +76,8 @@ async def health(req: Request) -> JSONResponse:
 @app.route(route="inquiries", methods=["GET"])
 async def list_inquiries(req: Request) -> JSONResponse:
     query = (
-        "SELECT c.id, c.title, c.body, c.status, c.createdAt "
+        "SELECT c.id, c.title, c.body, c.status, c.createdAt, "
+        "c.classification, c.assignee, c.classifyAttempts "
         "FROM c ORDER BY c.createdAt DESC"
     )
     items = list(get_inquiries().query_items(query=query, enable_cross_partition_query=True))
@@ -217,29 +222,83 @@ async def chat(req: Request) -> StreamingResponse:
     budget = int(os.environ.get("HISTORY_TOKEN_BUDGET", config["history_token_budget"]))
     user_created_at = now_iso()
 
-    # TODO(コマ7 演習手順5-1): 送る messages を、会話の履歴から組み立てる。
-    #   いまは今回の質問しか送っていないので、モデルはそれまでの会話を知らない。
-    messages = [
-        {"role": "system", "content": config["system_prompt"]},
-        {"role": "user", "content": message},
-    ]
+    history = load_history(conversation_id, config["max_history_messages"])
+    history.append({"role": "user", "content": message})
+    messages = [{"role": "system", "content": config["system_prompt"]}] + trim_history(history, budget)
 
     def generate():
         # 最初のイベント: 会話の ID と、モデルに送ったメッセージの件数を知らせる
         yield sse({"type": "start", "conversationId": conversation_id, "sentMessages": len(messages)})
 
         try:
-            # TODO(コマ7 演習手順5-2): いまは応答を最後まで受け取ってから、まとめて1回で送っている。
-            #   受け取ったそばから、少しずつブラウザに送るように書き換える。
-            reply = "".join(llm.stream_chat(messages, config["max_output_tokens"]))
-            yield sse({"type": "delta", "text": reply})
+            parts = []
+            for piece in llm.stream_chat(messages, config["max_output_tokens"]):
+                parts.append(piece)
+                yield sse({"type": "delta", "text": piece})
+            reply = "".join(parts)
         except llm.LLMError as e:
             # 途中で失敗した。HTTP の状態（200）は送ってしまっているので、エラーもイベントで知らせる
             yield sse({"type": "error", "message": str(e)})
             return
 
-        # TODO(コマ7 演習手順5-3): 応答が最後まで届いたら、質問と応答を Cosmos DB に保存する。
+        save_message(conversation_id, "user", message, user_created_at)
+        save_message(conversation_id, "assistant", reply, now_iso())
 
         yield sse({"type": "end"})
 
     return sse_response(generate())
+
+
+# =====================================================================
+# 問い合わせの分類（コマ8）
+# =====================================================================
+@app.route(route="inquiries/classify", methods=["POST"])
+async def classify_inquiry(req: Request) -> JSONResponse:
+    inquiry_id = parse_conversation_id(req.query_params.get("id", ""))  # 問い合わせの ID も UUID の形
+    if inquiry_id is None:
+        return JSONResponse({"error": "問い合わせの ID が正しくない"}, status_code=400)
+    try:
+        item = get_inquiries().read_item(item=inquiry_id, partition_key=inquiry_id)
+    except CosmosResourceNotFoundError:
+        return JSONResponse({"error": "問い合わせが見つからない"}, status_code=404)
+
+    config = llm.load_config()
+    # アプリ設定 STRUCTURED_OUTPUT_MODE があれば、設定ファイルより優先する（モデルを変えたときの切り替え用）
+    mode = os.environ.get("STRUCTURED_OUTPUT_MODE", config["structured_output_mode"])
+
+    def call_llm(messages):
+        return llm.complete_json(
+            messages, classification.json_schema(), mode, config["classify_max_output_tokens"]
+        )
+
+    try:
+        # モデルの応答を待つ間、ほかのリクエストを止めないように、別のスレッドで動かす
+        result = await asyncio.to_thread(
+            classification.classify, item, call_llm, config["max_classify_attempts"], mode
+        )
+    except llm.LLMError as e:
+        # モデルを呼べなかった（429・タイムアウトなど）。形式の誤りとは別の失敗（コマ9で扱う）
+        return JSONResponse({"error": str(e)}, status_code=503)
+    except ValueError:
+        # モデルの出力を検証できなかった（再試行の仕組みがないとき）
+        return JSONResponse({"error": "AI の出力を解釈できなかった"}, status_code=502)
+
+    decision = classification.route(result)
+    item["classification"] = result.classification.model_dump()
+    item["assignee"] = decision["assignee"]
+    item["status"] = decision["status"]
+    item["classifyAttempts"] = result.attempts
+    item["classifiedAt"] = now_iso()
+    get_inquiries().replace_item(item=item["id"], body=item)
+
+    return JSONResponse(
+        {
+            "id": item["id"],
+            "classification": item["classification"],
+            "assignee": item["assignee"],
+            "status": item["status"],
+            "attempts": result.attempts,
+            "errors": result.errors,
+            "fallback": result.fallback,
+        }
+    )
