@@ -1,21 +1,34 @@
 """架空の問い合わせ（sample_inquiries.json）を、API に登録する（コマ8）
 
 使い方（azd up の後に、Codespace のターミナルで）
-  eval "$(azd env get-values)"
   python lesson08/seed.py
 
-API_BASE_URL（azd の環境の値）に、POST /api/inquiries で1件ずつ送る。LLM は呼ばない。
+API の URL（azd の環境の値 API_BASE_URL）を azd から読み、POST /api/inquiries で1件ずつ送る。LLM は呼ばない。
 """
 
 import json
 import os
+import subprocess
 import sys
 import urllib.request
 from pathlib import Path
 
-base = os.environ.get("API_BASE_URL")
-if not base:
-    sys.exit('API_BASE_URL がない。先に eval "$(azd env get-values)" を実行する。')
+
+def api_base_url():
+    """環境変数 API_BASE_URL があればそれを、なければ azd の環境から読む"""
+    # 注意: eval "$(azd env get-values)" で作った変数は export されないので、Python からは見えない
+    if os.environ.get("API_BASE_URL"):
+        return os.environ["API_BASE_URL"]
+    try:
+        result = subprocess.run(["azd", "env", "get-value", "API_BASE_URL"], capture_output=True, text=True)
+    except FileNotFoundError:
+        return ""  # azd が見つからない
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+base = api_base_url()
+if not base.startswith("https://"):
+    sys.exit("API の URL が分からない。azd up が終わっているか、azd env list で環境を確かめる。")
 
 items = json.loads(Path(__file__).with_name("sample_inquiries.json").read_text(encoding="utf-8"))
 for item in items:
