@@ -1,27 +1,47 @@
-"""言語モデル（LLM）を呼ぶ部分（コマ7・8。教員が用意したもの）
+"""言語モデル（LLM）を呼ぶ部分（コマ7〜9。教員が用意したもの）
 
-アプリ設定 LLM_PROVIDER で、呼び先を切り替える。
-  mock        : モックLLM（既定）。OpenRouter を呼ばない。共有の利用上限を消費しない
-  openrouter  : OpenRouter の本物のモデル。教員の合図があったときだけ使う
+コマ9で「プロバイダ」の形に整理した。
+  プロバイダ = LLM の呼び先。同じ形の関数（complete_json・stream_chat）を持つ。
+    MockProvider        : モックLLM（既定）。OpenRouter を呼ばない。共有の利用上限を消費しない
+    OpenRouterProvider  : OpenRouter の本物のモデル。教員の合図があったときだけ使う
+  呼ぶ側（function_app.py・resilience.py）は、どちらのプロバイダかを気にしなくてよい。
+  呼び先は、アプリ設定 LLM_PROVIDER（mock / openrouter）で切り替える。
 
-  stream_chat(messages)   応答の文字列を「少しずつ」返す（ジェネレーター。コマ7のアシスタント）
-  complete_json(...)      応答をまとめて返す。JSON で答えさせるときに使う（コマ8の分類）
-呼ぶ側（function_app.py）は、どちらが動いているかを気にしなくてよい。
-（呼び先を差し替えられるようにする設計は、コマ9で詳しく扱う）
+失敗は、次の2種類の例外に分けて知らせる（コマ9）。
+  TransientLLMError : 待てば直るかもしれない失敗（429・502・503・408・タイムアウト・接続の失敗）
+                      → 待ってから再試行する／別のモデルに切り替える価値がある
+  LLMError          : 再試行しても直らない失敗（400・401・402・403、設定の誤り）
+                      → すぐに諦める。同じ要求を送り直しても、同じ失敗になるだけ
+モックも、本物と同じ例外を出せる（アプリ設定 MOCK_FAULT）。だから、本物を呼ばずに
+「429 が返ってきたときの動き」を作って確かめられる。
 """
 
+import hashlib
 import json
 import os
 import time
 from pathlib import Path
 
 CONFIG_PATH = Path(__file__).with_name("llm_config.json")
-PLACEHOLDER_MODEL = "set-by-teacher/model-name:free"
+PLACEHOLDER_PREFIX = "set-by-teacher/"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
 class LLMError(Exception):
-    """LLM を呼べなかった・途中で失敗したことを表す（利用者に見せてよい文だけを入れる）"""
+    """LLM を呼べなかった（再試行しても直らない）。利用者に見せてよい文だけを入れる"""
+
+
+class TransientLLMError(LLMError):
+    """待てば直るかもしれない失敗。status は HTTP の状態コード（タイムアウトなどは None）
+
+    retry_after は、提供元が「何秒待ってから送り直せ」と知らせてきた秒数（Retry-After ヘッダー）。
+    知らせてこなかったときは None。
+    """
+
+    def __init__(self, message, status=None, retry_after=None):
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
 
 
 def load_config():
@@ -32,129 +52,41 @@ def provider_name():
     return os.environ.get("LLM_PROVIDER", "mock")
 
 
-def stream_chat(messages, max_tokens):
-    """messages を送り、応答の文字列を少しずつ返す"""
-    if provider_name() == "openrouter":
-        yield from _stream_openrouter(messages, max_tokens)
-    else:
-        yield from _stream_mock(messages)
+def model_candidates(config=None):
+    """呼んでよいモデルを、使う順に返す（1つ目が主のモデル、2つ目以降がフォールバック）
 
-
-# ---------------------------------------------------------------------
-# モックLLM: 受け取った messages の様子を、そのまま文章にして少しずつ返す
-#   本物の代わりに、「何件・どれくらいの量を送ったか」を確かめるのに使う
-# ---------------------------------------------------------------------
-def _stream_mock(messages):
-    last = messages[-1]["content"]
-    roles = [m["role"] for m in messages]
-    chars = sum(len(m["content"]) for m in messages)
-    text = (
-        "（モックLLMの応答）"
-        f"受け取ったメッセージは {len(messages)} 件"
-        f"（system {roles.count('system')}・user {roles.count('user')}・"
-        f"assistant {roles.count('assistant')}）、合計 {chars} 文字だった。"
-        f"最後の質問の先頭は「{last[:20]}」である。"
-    )
-    for i in range(0, len(text), 4):
-        time.sleep(0.08)  # 本物のように少しずつ届くことを再現する
-        yield text[i : i + 4]
-
-
-# ---------------------------------------------------------------------
-# 本物: OpenRouter（OpenAI 互換 API）
-# ---------------------------------------------------------------------
-def _openrouter_client():
-    """呼ぶ前の確認をして、クライアントとモデルの ID を返す"""
-    from openai import OpenAI
-
-    model = load_config()["chat_model"]
-    if model == PLACEHOLDER_MODEL:
-        raise LLMError("モデルが指定されていない（教員の指示を待つ）")
-    if not model.endswith(":free"):
-        # 許可するモデルは無料モデルだけ。誤って有料モデルを指定しても呼ばない
-        raise LLMError("無料モデル以外は呼ばない設定になっている")
-
-    api_key = os.environ.get("OPENROUTER_API_KEY", "")
-    if not api_key.startswith("sk-or-"):
-        raise LLMError("OpenRouter のキーが届いていない（Key Vault を確かめる）")
-
-    # max_retries=0: ライブラリの自動の再試行を止める（共有の利用上限を消費するため。コマ9で扱う）
-    client = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=api_key, timeout=60, max_retries=0)
-    return client, model
-
-
-def _stream_openrouter(messages, max_tokens):
-    from openai import APIConnectionError, APIStatusError, APITimeoutError
-
-    client, model = _openrouter_client()
-    try:
-        stream = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_tokens=max_tokens,  # 出力の長さの上限
-            stream=True,
-        )
-        for chunk in stream:
-            if not chunk.choices:
-                continue
-            choice = chunk.choices[0]
-            if choice.finish_reason == "error":
-                # 途中で失敗した（HTTP の状態は 200 のまま、イベントとして届く）
-                raise LLMError("モデルの応答が途中で失敗した")
-            if choice.delta and choice.delta.content:
-                yield choice.delta.content
-    except APIStatusError as e:
-        if e.status_code == 429:
-            raise LLMError("利用上限に達した（429）。しばらく待つ") from e
-        raise LLMError(f"モデルを呼べなかった（HTTP {e.status_code}）") from e
-    except (APITimeoutError, APIConnectionError) as e:
-        raise LLMError("モデルから時間内に応答がなかった") from e
-
-
-# =====================================================================
-# JSON で答えさせる（コマ8）
-# =====================================================================
-def complete_json(messages, schema, mode, max_tokens):
-    """messages を送り、応答の文字列（JSON のはず）をまとめて返す
-
-    mode
-      json_schema : JSON Schema を API の response_format で渡す（構造化出力に対応したモデル向け）
-      prompt      : JSON Schema は渡さない（プロンプトの指示だけで JSON を出させる。非対応のモデル向け）
-    どちらの場合も、返ってきた文字列が正しいかどうかは、呼ぶ側が必ず検証する。
+    許可するのは、設定ファイルに書いた無料モデル（:free で終わるもの）だけ。
+    フォールバックでも有料モデルは呼ばない（教員の費用になるため）。
     """
+    config = config or load_config()
+    names = [config["chat_model"]] + list(config.get("fallback_models", []))
+    if provider_name() == "mock":
+        return names  # モックは、教員がモデルを指定する前でも動くようにする
+    return [m for m in names if m.endswith(":free") and not m.startswith(PLACEHOLDER_PREFIX)]
+
+
+def get_provider():
     if provider_name() == "openrouter":
-        return _complete_json_openrouter(messages, schema, mode, max_tokens)
-    return _complete_json_mock(messages, mode)
+        return OpenRouterProvider()
+    return MockProvider()
 
 
-def _complete_json_openrouter(messages, schema, mode, max_tokens):
-    from openai import APIConnectionError, APIStatusError, APITimeoutError
-
-    client, model = _openrouter_client()
-    options = {}
-    if mode == "json_schema":
-        options["response_format"] = {"type": "json_schema", "json_schema": schema}
-        # 構造化出力に対応した提供元だけに送ってもらう（OpenRouter の機能）
-        options["extra_body"] = {"provider": {"require_parameters": True}}
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=0,  # 同じ入力には、なるべく同じ出力を返させる
-            **options,
-        )
-    except APIStatusError as e:
-        if e.status_code == 429:
-            raise LLMError("利用上限に達した（429）。しばらく待つ") from e
-        raise LLMError(f"モデルを呼べなかった（HTTP {e.status_code}）") from e
-    except (APITimeoutError, APIConnectionError) as e:
-        raise LLMError("モデルから時間内に応答がなかった") from e
-    if not response.choices:
-        raise LLMError("モデルの応答が空だった")
-    return response.choices[0].message.content or ""
+# =====================================================================
+# アシスタント（コマ7）: 応答の文字列を少しずつ返す
+#   ストリーミングは、最初の文字を画面に送った後では「やり直し」ができないので、
+#   コマ9の再試行・フォールバックの対象にしていない（主のモデルを1回だけ呼ぶ）。
+# =====================================================================
+def stream_chat(messages, max_tokens):
+    provider = get_provider()
+    candidates = model_candidates()
+    if not candidates:
+        raise LLMError("呼んでよいモデルが設定されていない（教員の指示を待つ）")
+    yield from provider.stream_chat(candidates[0], messages, max_tokens)
 
 
+# =====================================================================
+# モックLLM
+# =====================================================================
 # 分類のモック: 問い合わせの文字列に含まれる言葉で、決まった結果を返す
 _MOCK_RULES = [
     (("パスワード", "ロック", "アカウント", "ログイン"), "アカウント・パスワード"),
@@ -164,45 +96,178 @@ _MOCK_RULES = [
     (("会議室", "備品", "鍵", "駐車", "郵便", "空調"), "総務・施設"),
 ]
 
+# rate_limit_once で「この要求は1回目か」を覚えておく（このインスタンスの中だけ）
+_seen_requests = set()
 
-def _complete_json_mock(messages, mode):
-    """モックLLM（分類用）。アプリ設定 MOCK_FAULT で、わざと誤った出力を返せる
 
-      MOCK_FAULT=none            : 正しい JSON を返す（既定）
-      MOCK_FAULT=invalid_once    : 1回目だけ、決まりに合わない値を返す（再試行の練習）
-      MOCK_FAULT=always_invalid  : 毎回、JSON ではない文を返す（諦めるときの練習）
+class MockProvider:
+    """モックLLM。アプリ設定 MOCK_FAULT で、わざと失敗させられる
+
+    形式の失敗（コマ8）
+      none            : 正しい JSON を返す（既定）
+      invalid_once    : 1回目だけ、決まりに合わない値を返す
+      always_invalid  : 毎回、JSON ではない文を返す
+    通信の失敗（コマ9）
+      rate_limit_once : 同じ要求の1回目だけ、429（Retry-After: 2秒）で失敗する
+      primary_down    : 主のモデルだけ、毎回 503 で失敗する（フォールバックのモデルは動く）
+      all_rate_limited: どのモデルも、毎回 429（Retry-After: 2秒）で失敗する
     """
-    fault = os.environ.get("MOCK_FAULT", "none")
-    retried = any(m["role"] == "assistant" for m in messages)  # 再試行のときは、前の出力が入っている
-    if fault == "always_invalid":
-        return "分類しました。カテゴリはネットワーク関係で、急ぎだと思います。"
-    if fault == "invalid_once" and not retried:
-        return json.dumps(
-            {"category": "ネットワーク", "priority": "緊急", "summary": "VPN に接続できない", "needs_human": False},
-            ensure_ascii=False,
-        )
 
-    text = messages[-1]["content"] if not retried else messages[1]["content"]
-    category = "その他"
-    for words, name in _MOCK_RULES:
-        if any(w in text for w in words):
-            category = name
-            break
-    if any(w in text for w in ("急ぎではない", "いつでもよい")):
-        priority = "低"
-    elif any(w in text for w in ("至急", "止まって", "できない")):
-        priority = "高"
-    else:
-        priority = "中"
-    title = text.split("\n")[0].replace("件名:", "").strip()
-    result = {
-        "category": category,
-        "priority": priority,
-        "summary": f"（モック）{title}"[:60],
-        "needs_human": category == "その他",
-    }
-    body = json.dumps(result, ensure_ascii=False)
-    if mode == "prompt":
-        # 構造化出力を使わないモデルがよくやる返し方（前置きの文と、コードブロック）をまねる
-        return f"分類結果は次のとおりです。\n```json\n{body}\n```"
-    return body
+    def __init__(self):
+        self.fault = os.environ.get("MOCK_FAULT", "none")
+
+    def _maybe_fail(self, model, messages):
+        if self.fault == "all_rate_limited":
+            raise TransientLLMError(f"利用上限に達した（429・モック・{model}）", 429, 2.0)
+        if self.fault == "primary_down" and model == load_config()["chat_model"]:
+            raise TransientLLMError(f"提供元が混雑している（503・モック・{model}）", 503, None)
+        if self.fault == "rate_limit_once":
+            key = hashlib.sha256((model + json.dumps(messages, ensure_ascii=False)).encode("utf-8")).hexdigest()
+            if key not in _seen_requests:
+                _seen_requests.add(key)
+                raise TransientLLMError(f"利用上限に達した（429・モック・{model}）", 429, 2.0)
+
+    def stream_chat(self, model, messages, max_tokens):
+        """受け取った messages の様子を、そのまま文章にして少しずつ返す"""
+        self._maybe_fail(model, messages)
+        last = messages[-1]["content"]
+        roles = [m["role"] for m in messages]
+        chars = sum(len(m["content"]) for m in messages)
+        text = (
+            "（モックLLMの応答）"
+            f"受け取ったメッセージは {len(messages)} 件"
+            f"（system {roles.count('system')}・user {roles.count('user')}・"
+            f"assistant {roles.count('assistant')}）、合計 {chars} 文字だった。"
+            f"最後の質問の先頭は「{last[:20]}」である。"
+        )
+        for i in range(0, len(text), 4):
+            time.sleep(0.08)  # 本物のように少しずつ届くことを再現する
+            yield text[i : i + 4]
+
+    def complete_json(self, model, messages, schema, mode, max_tokens):
+        """分類用のモック。決まった規則で分類し、JSON の文字列を返す"""
+        self._maybe_fail(model, messages)
+        retried = any(m["role"] == "assistant" for m in messages)  # 形式の再試行のときは、前の出力が入っている
+        if self.fault == "always_invalid":
+            return "分類しました。カテゴリはネットワーク関係で、急ぎだと思います。"
+        if self.fault == "invalid_once" and not retried:
+            return json.dumps(
+                {"category": "ネットワーク", "priority": "緊急", "summary": "VPN に接続できない", "needs_human": False},
+                ensure_ascii=False,
+            )
+
+        text = messages[1]["content"]  # 問い合わせの件名と本文
+        category = "その他"
+        for words, name in _MOCK_RULES:
+            if any(w in text for w in words):
+                category = name
+                break
+        if any(w in text for w in ("急ぎではない", "いつでもよい")):
+            priority = "低"
+        elif any(w in text for w in ("至急", "止まって", "できない")):
+            priority = "高"
+        else:
+            priority = "中"
+        title = text.split("\n")[0].replace("件名:", "").strip()
+        result = {
+            "category": category,
+            "priority": priority,
+            "summary": f"（モック）{title}"[:60],
+            "needs_human": category == "その他",
+        }
+        body = json.dumps(result, ensure_ascii=False)
+        if mode == "prompt":
+            # 構造化出力を使わないモデルがよくやる返し方（前置きの文と、コードブロック）をまねる
+            return f"分類結果は次のとおりです。\n```json\n{body}\n```"
+        return body
+
+
+# =====================================================================
+# 本物: OpenRouter（OpenAI 互換 API）
+# =====================================================================
+def _retry_after_seconds(error):
+    """エラーの応答の Retry-After ヘッダー（秒）を読む。なければ None"""
+    response = getattr(error, "response", None)
+    value = response.headers.get("retry-after") if response is not None else None
+    try:
+        return float(value) if value is not None else None
+    except ValueError:
+        return None  # 日時の形で来た場合などは、使わない（自分で待ち時間を決める）
+
+
+def _translate_error(error, model):
+    """OpenAI の SDK の例外を、このアプリの2種類の例外に変える"""
+    from openai import APIConnectionError, APIStatusError, APITimeoutError
+
+    if isinstance(error, APIStatusError):
+        status = error.status_code
+        if status == 429:
+            return TransientLLMError(f"利用上限に達した（429・{model}）", status, _retry_after_seconds(error))
+        if status in (408, 502, 503):
+            return TransientLLMError(f"提供元が応答できなかった（HTTP {status}・{model}）", status, _retry_after_seconds(error))
+        # 400（要求の誤り）・401（キーの誤り）・402（残高不足）・403（禁止）などは、送り直しても直らない
+        return LLMError(f"モデルを呼べなかった（HTTP {status}・{model}）")
+    if isinstance(error, (APITimeoutError, APIConnectionError)):
+        return TransientLLMError(f"モデルから時間内に応答がなかった（{model}）")
+    return LLMError(f"モデルを呼べなかった（{model}）")
+
+
+class OpenRouterProvider:
+    def _client(self, model):
+        from openai import OpenAI
+
+        if model.startswith(PLACEHOLDER_PREFIX):
+            raise LLMError("モデルが指定されていない（教員の指示を待つ）")
+        if not model.endswith(":free"):
+            # 許可するモデルは無料モデルだけ。誤って有料モデルを指定しても呼ばない
+            raise LLMError("無料モデル以外は呼ばない設定になっている")
+        api_key = os.environ.get("OPENROUTER_API_KEY", "")
+        if not api_key.startswith("sk-or-"):
+            raise LLMError("OpenRouter のキーが届いていない（Key Vault を確かめる）")
+        # max_retries=0: SDK の自動の再試行を止める。再試行は resilience.py で、回数を数えながら自分で行う
+        #   （SDK も再試行すると、回数が掛け算で増え、共有の利用上限を見えないところで消費する）
+        return OpenAI(base_url=OPENROUTER_BASE_URL, api_key=api_key, timeout=30, max_retries=0)
+
+    def stream_chat(self, model, messages, max_tokens):
+        from openai import OpenAIError
+
+        client = self._client(model)
+        try:
+            stream = client.chat.completions.create(
+                model=model, messages=messages, max_tokens=max_tokens, stream=True
+            )
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                choice = chunk.choices[0]
+                if choice.finish_reason == "error":
+                    # 途中で失敗した（HTTP の状態は 200 のまま、イベントとして届く）
+                    raise LLMError("モデルの応答が途中で失敗した")
+                if choice.delta and choice.delta.content:
+                    yield choice.delta.content
+        except OpenAIError as e:
+            raise _translate_error(e, model) from e
+
+    def complete_json(self, model, messages, schema, mode, max_tokens):
+        from openai import OpenAIError
+
+        client = self._client(model)
+        options = {}
+        if mode == "json_schema":
+            options["response_format"] = {"type": "json_schema", "json_schema": schema}
+            # 構造化出力に対応した提供元だけに送ってもらう（OpenRouter の機能）
+            options["extra_body"] = {"provider": {"require_parameters": True}}
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=0,  # 同じ入力には、なるべく同じ出力を返させる
+                **options,
+            )
+        except OpenAIError as e:
+            raise _translate_error(e, model) from e
+        if not response.choices:
+            # 状態コードが 200 でも、本文がエラーで中身がないことがある（提供元の途中の失敗）
+            raise TransientLLMError(f"モデルの応答が空だった（{model}）")
+        return response.choices[0].message.content or ""

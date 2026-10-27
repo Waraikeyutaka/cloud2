@@ -9,6 +9,7 @@
                         {"conversationId": "...（省略すると新しい会話）", "message": "..."}
   GET  /api/conversations?id=...  会話の履歴を返す（コマ7。画面を開き直したときに使う）
   POST /api/inquiries/classify?id=...  問い合わせを AI で分類し、担当に振り分ける（コマ8）
+                        コマ9から、キャッシュ・再試行・フォールバック・呼ぶ回数の上限を加えた
 
 接続先などの設定は、コードに書かずに「アプリ設定」（環境変数）から読む。
 注意: この時点では認証がなく、誰でも読み書きできる（コマ11で認証を加える）。
@@ -33,6 +34,8 @@ from azurefunctions.extensions.http.fastapi import JSONResponse, Request, Stream
 
 import classification
 import llm
+import llm_cache
+import resilience
 from history import trim_history
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
@@ -250,8 +253,67 @@ async def chat(req: Request) -> StreamingResponse:
 
 
 # =====================================================================
-# 問い合わせの分類（コマ8）
+# 問い合わせの分類（コマ8・9）
 # =====================================================================
+def get_llm_cache():
+    return llm_cache.CosmosCache(get_database().get_container_client(os.environ["COSMOS_CACHE_CONTAINER"]))
+
+
+def classify_with_llm(item, config, mode):
+    """問い合わせ1件を分類する（コマ9: キャッシュ → 再試行・フォールバック → 形式の検証と再試行）
+
+    戻り値: (分類の結果, 情報)。情報には、キャッシュを使ったか・LLM を呼んだ回数・呼んだ記録が入る。
+    モデルを呼べなかったときは llm.LLMError が出る。
+    """
+    models = llm.model_candidates(config)
+    if not models:
+        raise llm.LLMError("呼んでよいモデルが設定されていない（教員の指示を待つ）")
+    schema = classification.json_schema()
+
+    # 1. キャッシュ: 同じ入力を前に分類していれば、LLM を呼ばずにその結果を使う
+    cache = get_llm_cache()
+    # モデルの ID の前に呼び先（mock / openrouter）を付ける。モックの答えを、本物の答えとして使わないように
+    model_id = f"{llm.provider_name()}/{models[0]}"
+    key = llm_cache.cache_key("classify", model_id, classification.build_messages(item, mode), schema, mode)
+    cached = cache.get(key) if key else None  # キーを作れないときは、キャッシュを使わない
+    if cached is not None:
+        result = classification.ClassifyResult(
+            classification.InquiryClassification.model_validate(cached), attempts=0
+        )
+        return result, {"cached": True, "llmCalls": 0, "callLog": ["キャッシュの結果を使った（LLM は呼んでいない）"]}
+
+    # 2. LLM を呼ぶ。1件の分類で呼ぶ回数の合計に上限を付ける（形式の再試行と通信の再試行が掛け算で増えないように）
+    budget = resilience.CallBudget(config["max_llm_calls_per_request"])
+    provider = llm.get_provider()
+    call_log = []
+
+    def call_llm(messages):
+        outcome = resilience.call_with_resilience(
+            lambda model: provider.complete_json(
+                model, messages, schema, mode, config["classify_max_output_tokens"]
+            ),
+            models,
+            budget,
+            max_retries_per_model=config["max_retries_per_model"],
+            base_delay=config["retry_base_delay_seconds"],
+            max_delay=config["retry_max_delay_seconds"],
+            max_wait=config["retry_max_wait_seconds"],
+            log=call_log,  # 形式の再試行をまたいで、1つの記録に書き足していく
+        )
+        return outcome.text
+
+    try:
+        result = classification.classify(item, call_llm, config["max_classify_attempts"], mode)
+    except llm.LLMError as e:
+        e.call_log = call_log  # どこまで試したかを、エラーの応答にも載せる
+        raise
+
+    # 3. 人に回した結果（fallback）はキャッシュしない。次に分類し直したときに、もう一度 AI に聞けるように
+    if key and not result.fallback:
+        cache.set(key, result.classification.model_dump(), config["cache_ttl_seconds"])
+    return result, {"cached": False, "llmCalls": budget.used, "callLog": call_log}
+
+
 @app.route(route="inquiries/classify", methods=["POST"])
 async def classify_inquiry(req: Request) -> JSONResponse:
     inquiry_id = parse_conversation_id(req.query_params.get("id", ""))  # 問い合わせの ID も UUID の形
@@ -266,22 +328,12 @@ async def classify_inquiry(req: Request) -> JSONResponse:
     # アプリ設定 STRUCTURED_OUTPUT_MODE があれば、設定ファイルより優先する（モデルを変えたときの切り替え用）
     mode = os.environ.get("STRUCTURED_OUTPUT_MODE", config["structured_output_mode"])
 
-    def call_llm(messages):
-        return llm.complete_json(
-            messages, classification.json_schema(), mode, config["classify_max_output_tokens"]
-        )
-
     try:
-        # モデルの応答を待つ間、ほかのリクエストを止めないように、別のスレッドで動かす
-        result = await asyncio.to_thread(
-            classification.classify, item, call_llm, config["max_classify_attempts"], mode
-        )
+        # モデルの応答や再試行の待ち時間の間、ほかのリクエストを止めないように、別のスレッドで動かす
+        result, info = await asyncio.to_thread(classify_with_llm, item, config, mode)
     except llm.LLMError as e:
-        # モデルを呼べなかった（429・タイムアウトなど）。形式の誤りとは別の失敗（コマ9で扱う）
-        return JSONResponse({"error": str(e)}, status_code=503)
-    except ValueError:
-        # モデルの出力を検証できなかった（再試行の仕組みがないとき）
-        return JSONResponse({"error": "AI の出力を解釈できなかった"}, status_code=502)
+        # 再試行・フォールバックをしても、モデルから応答を得られなかった。問い合わせは分類しないままにする
+        return JSONResponse({"error": str(e), "callLog": getattr(e, "call_log", [])}, status_code=503)
 
     decision = classification.route(result)
     item["classification"] = result.classification.model_dump()
@@ -300,5 +352,6 @@ async def classify_inquiry(req: Request) -> JSONResponse:
             "attempts": result.attempts,
             "errors": result.errors,
             "fallback": result.fallback,
+            **info,
         }
     )

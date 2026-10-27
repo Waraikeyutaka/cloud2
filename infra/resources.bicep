@@ -16,6 +16,10 @@
 //   - アプリ設定: COSMOS_CONVERSATIONS_CONTAINER、LLM_PROVIDER、PYTHON_ENABLE_INIT_INDEXING
 //
 // コマ8: 構成の変更はない（問い合わせのドキュメントに、分類の結果の項目が増えるだけ）
+//
+// コマ9で追加したもの
+//   - Cosmos DB のコンテナー llmcache（LLM の応答のキャッシュ。項目ごとの TTL で自動で消える）
+//   - アプリ設定: COSMOS_CACHE_CONTAINER
 // =====================================================================
 param location string
 param webLocation string
@@ -27,6 +31,7 @@ param principalId string
 var databaseName = 'appdb'
 var containerName = 'inquiries'
 var conversationsContainerName = 'conversations'
+var cacheContainerName = 'llmcache'
 var deploymentContainerName = 'deploymentpackage'
 var openRouterSecretName = 'openrouter-api-key'
 
@@ -147,6 +152,24 @@ resource conversationsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDataba
   }
 }
 
+// LLM の応答のキャッシュ（コマ9）
+//   パーティションキーはキャッシュのキー（id）そのもの。1件ずつ読み書きするだけなので、これで足りる
+//   defaultTtl: -1 は「TTL を使えるようにするが、既定では消さない」。消すまでの秒数は、項目ごとの ttl で決める
+resource cacheContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2024-05-15' = {
+  parent: database
+  name: cacheContainerName
+  properties: {
+    resource: {
+      id: cacheContainerName
+      partitionKey: {
+        paths: [ '/id' ]
+        kind: 'Hash'
+      }
+      defaultTtl: -1
+    }
+  }
+}
+
 // ---------------------------------------------------------------------
 // Functions（Flex Consumption・Python）: API
 // ---------------------------------------------------------------------
@@ -232,6 +255,10 @@ resource api 'Microsoft.Web/sites@2024-04-01' = {
           value: conversationsContainerName
         }
         {
+          name: 'COSMOS_CACHE_CONTAINER'
+          value: cacheContainerName
+        }
+        {
           name: 'OPENROUTER_API_KEY'
           value: '@Microsoft.KeyVault(VaultName=${keyVault.name};SecretName=${openRouterSecretName})'
         }
@@ -251,6 +278,7 @@ resource api 'Microsoft.Web/sites@2024-04-01' = {
   dependsOn: [
     deploymentContainer
     conversationsContainer
+    cacheContainer
   ]
 }
 

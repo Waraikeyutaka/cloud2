@@ -51,6 +51,7 @@ export default function App() {
       const data = await res.json()
       if (!res.ok) {
         setMessage(data.error ?? `分類できませんでした（HTTP ${res.status}）`)
+        setLastResult(data.callLog ? { failed: true, callLog: data.callLog } : null) // どこまで試したか（コマ9）
         return
       }
       setLastResult(data)
@@ -86,12 +87,23 @@ export default function App() {
 
       {message && <p className="message">{message}</p>}
 
-      {lastResult && (
+      {lastResult && !lastResult.failed && (
         <p className="info">
-          直前の分類: モデルを呼んだ回数 {lastResult.attempts} 回
+          直前の分類:{' '}
+          {lastResult.cached
+            ? 'キャッシュの結果を使った（LLM は呼んでいない）'
+            : `形式の検証の回数 ${lastResult.attempts} 回・LLM を呼んだ回数 ${lastResult.llmCalls} 回`}
           {lastResult.errors.length > 0 && `（検証に失敗した理由: ${lastResult.errors.join(' ／ ')}）`}
           {lastResult.fallback && ' → 上限まで失敗したので、人に回した'}
         </p>
+      )}
+      {/* LLM を呼んだ記録（コマ9）: どのモデルを呼び、どう失敗し、何秒待ったか */}
+      {lastResult?.callLog?.length > 0 && (
+        <ol className="call-log">
+          {lastResult.callLog.map((line, i) => (
+            <li key={i}>{line}</li>
+          ))}
+        </ol>
       )}
 
       <h2>一覧</h2>
